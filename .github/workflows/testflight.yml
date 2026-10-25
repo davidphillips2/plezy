@@ -1,0 +1,196 @@
+name: Ship TestFlight
+
+# Syncs upstream into this fork, then builds the iOS and tvOS apps and
+# uploads both to App Store Connect. Upstream changes carry this fork's
+# rebrand commit (rebased on top); the build number is bumped per run so
+# every upload is unique.
+#
+# Required repository secrets (set once):
+#   ASC_KEY_BASE64      — App Store Connect API key (.p8), base64
+#   ASC_KEY_ID          — 10-char key id
+#   ASC_ISSUER_ID       — issuer UUID
+#   DIST_P12_BASE64     — Apple Distribution cert+key as legacy-format p12, base64
+#   DIST_P12_PASSWORD   — password of that p12
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 9 * * *" # daily at 09:17 UTC
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ship-testflight
+  cancel-in-progress: false
+
+env:
+  FLUTTER_VERSION: "3.47.1"
+  TEAM_ID: CSBZ6AQTZ7
+
+jobs:
+  ship:
+    name: Sync, build, upload
+    runs-on: macos-26
+    timeout-minutes: 120
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
+        with:
+          fetch-depth: 0
+
+      - name: Select latest stable Xcode
+        run: sudo xcode-select -s "$(ls -d /Applications/Xcode*.app | sort -V | tail -1)"
+
+      - name: Sync with upstream
+        id: sync
+        run: |
+          set -euo pipefail
+          git config user.name "megaplex-ci"
+          git config user.email "ci@users.noreply.github.com"
+          git remote add upstream https://github.com/edde746/plezy.git
+          git fetch upstream main
+          BEFORE="$(git rev-parse HEAD)"
+          git rebase upstream/main
+          AFTER="$(git rev-parse HEAD)"
+          if [ "$BEFORE" != "$AFTER" ]; then
+            git push --force-with-lease origin main
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Skip build when upstream has no changes
+        if: steps.sync.outputs.changed == 'false' && github.event_name == 'schedule'
+        run: echo "Upstream unchanged; nothing to ship."
+
+      - name: Bump build number
+        if: steps.sync.outputs.changed == 'true' || github.event_name == 'workflow_dispatch'
+        run: |
+          set -euo pipefail
+          BUILD="$((2000 + GITHUB_RUN_NUMBER))"
+          echo "Build number: $BUILD"
+          ruby -e '
+            path = "pubspec.yaml"
+            text = File.read(path)
+            bumped = text.sub(/^version:.*$/) { |line| line.sub(/\+\d+$/, "+" + ARGV[0]) }
+            abort "pubspec.yaml version line not found" if bumped == text
+            File.write(path, bumped)
+          ' "$BUILD"
+          git add pubspec.yaml
+          git commit -m "ci: build $BUILD for TestFlight"
+          git push origin main
+          echo "build_number=$BUILD" >> "$GITHUB_OUTPUT"
+        id: bump
+        env:
+          GITHUB_RUN_NUMBER: ${{ github.run_number }}
+
+      - name: Import signing assets
+        if: steps.bump.outcome == 'success'
+        env:
+          DIST_P12_BASE64: ${{ secrets.DIST_P12_BASE64 }}
+          DIST_P12_PASSWORD: ${{ secrets.DIST_P12_PASSWORD }}
+          ASC_KEY_BASE64: ${{ secrets.ASC_KEY_BASE64 }}
+        run: |
+          set -euo pipefail
+          security create-keychain -p buildkey build.keychain-db
+          security default-keychain -s build.keychain-db
+          security unlock-keychain -p buildkey build.keychain-db
+          security set-keychain-settings -t 3600 build.keychain-db
+          printf '%s' "$DIST_P12_BASE64" | base64 -d > /tmp/dist.p12
+          security import /tmp/dist.p12 -k build.keychain-db -P "$DIST_P12_PASSWORD" \
+            -T /usr/bin/codesign -T /usr/bin/xcodebuild -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple: -s -k buildkey build.keychain-db
+          mkdir -p "$HOME/.appstoreconnect/private_keys"
+          printf '%s' "$ASC_KEY_BASE64" | base64 -d \
+            > "$HOME/.appstoreconnect/private_keys/AuthKey_${{ secrets.ASC_KEY_ID }}.p8"
+
+      - name: Set up Flutter
+        if: steps.bump.outcome == 'success'
+        uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+
+      - name: Cache tvOS engine
+        if: steps.bump.outcome == 'success'
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/.cache/flutter-tvos-engine
+          key: flutter-tvos-engine-${{ hashFiles('tvos/engine.version', 'tvos/engine.sha256') }}
+
+      - name: Install Dart dependencies
+        if: steps.bump.outcome == 'success'
+        run: flutter pub get
+
+      - name: Build and upload iOS
+        if: steps.bump.outcome == 'success'
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          KEY="$HOME/.appstoreconnect/private_keys/AuthKey_${ASC_KEY_ID}.p8"
+          flutter build ios --config-only --release --no-pub
+          (cd ios && pod install)
+          xcodebuild archive \
+            -workspace ios/Runner.xcworkspace \
+            -scheme Runner \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath /tmp/ship/ios.xcarchive \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$KEY" \
+            -authenticationKeyID "$ASC_KEY_ID" \
+            -authenticationKeyIssuerID "$ASC_ISSUER_ID"
+          xcodebuild -exportArchive \
+            -archivePath /tmp/ship/ios.xcarchive \
+            -exportOptionsPlist .github/ci/ios-export.plist \
+            -exportPath /tmp/ship/ios-ipa \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$KEY" \
+            -authenticationKeyID "$ASC_KEY_ID" \
+            -authenticationKeyIssuerID "$ASC_ISSUER_ID"
+          xcrun altool --upload-app --type ios \
+            -f /tmp/ship/ios-ipa/Megaplex.ipa \
+            --apiKey "$ASC_KEY_ID" --apiIssuer "$ASC_ISSUER_ID"
+          rm -rf /tmp/ship/ios.xcarchive /tmp/ship/ios-ipa \
+            ~/Library/Developer/Xcode/DerivedData/*
+
+      - name: Build and upload tvOS
+        if: steps.bump.outcome == 'success'
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          KEY="$HOME/.appstoreconnect/private_keys/AuthKey_${ASC_KEY_ID}.p8"
+          export FLUTTER_ROOT="$(dirname "$(dirname "$(command -v flutter)")")"
+          tvos/scripts/fetch_engine.sh
+          tvos/scripts/pod_install.sh
+          xcodebuild archive \
+            -workspace tvos/Runner.xcworkspace \
+            -scheme Runner \
+            -configuration Release \
+            -destination 'generic/platform=tvOS' \
+            -archivePath /tmp/ship/tvos.xcarchive \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$KEY" \
+            -authenticationKeyID "$ASC_KEY_ID" \
+            -authenticationKeyIssuerID "$ASC_ISSUER_ID"
+          xcodebuild -exportArchive \
+            -archivePath /tmp/ship/tvos.xcarchive \
+            -exportOptionsPlist .github/ci/tvos-export.plist \
+            -exportPath /tmp/ship/tvos-ipa \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$KEY" \
+            -authenticationKeyID "$ASC_KEY_ID" \
+            -authenticationKeyIssuerID "$ASC_ISSUER_ID"
+          xcrun altool --upload-app --type tvos \
+            -f /tmp/ship/tvos-ipa/Megaplex.ipa \
+            --apiKey "$ASC_KEY_ID" --apiIssuer "$ASC_ISSUER_ID"
+
+      - name: Report
+        if: always()
+        run: echo "Run finished. Sync changed: ${{ steps.sync.outputs.changed }}; build ${{ steps.bump.outputs.build_number || 'skipped' }}."
