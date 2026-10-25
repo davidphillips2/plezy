@@ -193,4 +193,5 @@ jobs:
 
       - name: Report
         if: always()
-        run: echo "Run finished. Sync changed: ${{ steps.sync.outputs.changed }}; build ${{ steps.bump.outputs.build_number || 'skipped' }}."
+        run: |
+          echo "Run finished. Sync changed = ${{ steps.sync.outputs.changed }}; build ${{ steps.bump.outputs.build_number || 'skipped' }}."
