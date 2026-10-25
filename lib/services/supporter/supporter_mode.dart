@@ -2,9 +2,9 @@
 /// alternate app icons.
 ///
 /// Chosen per build with `--dart-define=SUPPORTER_MODE=<name>`. Leaving it unset
-/// compiles the perks out.
+/// makes the perks free (local preference).
 enum SupporterMode {
-  /// Perks compiled out: the GitHub iOS IPA and Android APK, and local builds.
+  /// Perks compiled out: the GitHub iOS IPA and Android APK.
   off,
 
   /// Perks unlock through the one-time Supporter purchase: App Store and Google Play.
@@ -23,13 +23,13 @@ const String _supporterModeDefine = String.fromEnvironment('SUPPORTER_MODE');
 
 /// This build's [SupporterMode]. Const, so `off` builds tree-shake perk UI that
 /// is guarded by a comparison against it.
-const SupporterMode supporterBuildMode = _supporterModeDefine == 'iap'
+const SupporterMode supporterBuildMode = _supporterModeDefine == 'off'
+    ? SupporterMode.off
+    : _supporterModeDefine == 'iap'
     ? SupporterMode.iap
-    : _supporterModeDefine == 'unlocked'
-    ? SupporterMode.unlocked
     : _supporterModeDefine == 'msstore'
     ? SupporterMode.msstore
-    : SupporterMode.off;
+    : SupporterMode.unlocked;
 
 /// Whether this install shows the perks and how they unlock.
 enum SupporterAvailability {
